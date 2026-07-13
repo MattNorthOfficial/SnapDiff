@@ -1,0 +1,4 @@
+# Snapshot data and diff outputs contain machine-specific system configuration -
+# never commit them.
+snapshots/
+reports/
