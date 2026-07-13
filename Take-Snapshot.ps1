@@ -3,8 +3,8 @@
     Captures a point-in-time snapshot of Windows configuration state for before/after comparison.
 
 .DESCRIPTION
-    Captures the areas of the system that tweaking tools typically modify:
-      - Registry (targeted high-signal roots by default, or entire HKLM+HKCU with -Full)
+    Captures everything a tweaking tool could plausibly modify:
+      - Registry (entire HKLM + HKCU)
       - Services (start mode + state)
       - Power settings (active scheme + full setting dump)
       - Scheduled tasks (enabled/disabled state)
@@ -22,8 +22,8 @@
     .\Compare-Snapshots.ps1 -Before before -After after
 
 .EXAMPLE
-    .\Take-Snapshot.ps1 -Name full-before -Full
-    # Entire HKLM + HKCU. Slower and produces large files, but catches everything.
+    .\Take-Snapshot.ps1 -Name t1 -RegistryRoots 'HKCU\SOFTWARE\SomeApp'
+    # Restrict the registry capture for small, fast, focused experiments.
 #>
 [CmdletBinding()]
 param(
@@ -33,10 +33,8 @@ param(
     # Where snapshot folders are stored.
     [string]$OutputRoot = (Join-Path $PSScriptRoot "snapshots"),
 
-    # Export the entire HKLM and HKCU hives instead of the targeted default roots.
-    [switch]$Full,
-
     # Override the registry roots to export (e.g. "HKCU\SOFTWARE\MyApp").
+    # Default: entire HKLM + HKCU.
     [string[]]$RegistryRoots,
 
     # Skip registry export entirely (captures only services/power/tasks/network/startup).
@@ -72,24 +70,10 @@ $regDir = Join-Path $snapDir 'registry'
 New-Item -ItemType Directory -Path $regDir -Force | Out-Null
 
 # --- Registry roots -----------------------------------------------------------
+# Entire machine hive + current-user hive: catches anything a tweak could write,
+# including GPU driver class keys, Classes/COM, WOW6432Node and vendor settings.
 if (-not $RegistryRoots -or $RegistryRoots.Count -eq 0) {
-    if ($Full) {
-        $RegistryRoots = @('HKLM\SOFTWARE', 'HKLM\SYSTEM', 'HKCU')
-    }
-    else {
-        # High-signal areas that gaming/latency tweaks actually touch.
-        $RegistryRoots = @(
-            'HKLM\SYSTEM\CurrentControlSet\Control',            # scheduler, session manager, power, device classes
-            'HKLM\SYSTEM\CurrentControlSet\Services',           # all service config + driver parameters (Tcpip, NDIS...)
-            'HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion',   # run keys, policies, delivery optimization...
-            'HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion', # Multimedia SystemProfile, Image File Execution Options...
-            'HKLM\SOFTWARE\Policies',                           # group-policy style tweaks
-            'HKCU\Control Panel',                               # mouse, desktop, visual effects
-            'HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion',   # per-user run keys, ContentDeliveryManager...
-            'HKCU\SOFTWARE\Microsoft\GameBar',                  # Game Bar / Game Mode
-            'HKCU\System\GameConfigStore'                       # Game DVR, fullscreen optimizations
-        )
-    }
+    $RegistryRoots = @('HKLM\SOFTWARE', 'HKLM\SYSTEM', 'HKCU')
 }
 
 if (-not $SkipRegistry) {
@@ -172,7 +156,6 @@ $os = Get-CimInstance Win32_OperatingSystem
     OS              = $os.Caption
     OSVersion       = $os.Version
     RegistryRoots   = $RegistryRoots
-    Full            = [bool]$Full
     Errors          = $errors
     DurationSeconds = [math]::Round($sw.Elapsed.TotalSeconds, 1)
 } | ConvertTo-Json -Depth 4 | Set-Content -Path (Join-Path $snapDir 'meta.json') -Encoding UTF8

@@ -100,7 +100,24 @@ $xaml = @'
     <GroupBox Grid.Row="1" Header="1. Take snapshot">
       <DockPanel>
         <Button x:Name="TakeBtn" DockPanel.Dock="Right" Content="Take snapshot" FontWeight="SemiBold"/>
-        <CheckBox x:Name="FullCheck" DockPanel.Dock="Right" Content="Full registry (HKLM + HKCU, slower)"/>
+        <TextBlock DockPanel.Dock="Right" Text="&#x24D8;" FontSize="15" Foreground="#2B6CB0"
+                   VerticalAlignment="Center" Margin="12,0,12,0" Cursor="Help"
+                   ToolTipService.ShowDuration="60000" ToolTipService.InitialShowDelay="200">
+          <TextBlock.ToolTip>
+            <ToolTip>
+              <StackPanel Margin="6">
+                <TextBlock FontWeight="SemiBold" Text="Each snapshot captures:" Margin="0,0,0,6"/>
+                <TextBlock FontWeight="Normal" Text="&#8226; Registry: entire HKLM + HKCU hives (all system, driver and user settings)"/>
+                <TextBlock FontWeight="Normal" Text="&#8226; Services: start mode and running state"/>
+                <TextBlock FontWeight="Normal" Text="&#8226; Power: active plan and every power setting (AC/DC)"/>
+                <TextBlock FontWeight="Normal" Text="&#8226; Scheduled tasks: enabled/disabled state"/>
+                <TextBlock FontWeight="Normal" Text="&#8226; Network: TCP global settings and adapter advanced properties"/>
+                <TextBlock FontWeight="Normal" Text="&#8226; Startup items: Run keys and Startup folders"/>
+                <TextBlock FontWeight="Normal" Text="&#8226; Boot configuration: bcdedit output (requires administrator)"/>
+              </StackPanel>
+            </ToolTip>
+          </TextBlock.ToolTip>
+        </TextBlock>
         <Label Content="Name:"/>
         <TextBox x:Name="NameBox" VerticalContentAlignment="Center" Margin="4,0,0,0"/>
       </DockPanel>
@@ -174,7 +191,7 @@ $xaml = @'
 '@
 
 $window = [Windows.Markup.XamlReader]::Load((New-Object System.Xml.XmlNodeReader ([xml]$xaml)))
-foreach ($name in @('AdminBanner','RestartAdminBtn','TakeBtn','FullCheck','NameBox','SnapList',
+foreach ($name in @('AdminBanner','RestartAdminBtn','TakeBtn','NameBox','SnapList',
                     'SetBeforeBtn','SetAfterBtn','DeleteBtn','OpenFolderBtn','RefreshBtn',
                     'BeforeBox','AfterBox','NoFilterCheck','CompareBtn','OpenReportBtn','UndoBtn',
                     'LogBox','StatusText','ResultTabs','FilterBox','DiffList','ResultSummary')) {
@@ -356,8 +373,7 @@ $TakeBtn.Add_Click({
         [System.Windows.MessageBox]::Show("A snapshot named '$name' already exists.", 'SnapDiff', 'OK', 'Warning') | Out-Null
         return
     }
-    $fullArg = if ($FullCheck.IsChecked) { ' -Full' } else { '' }
-    $cmd = "& '$takeScript' -Name '$($name.Replace("'","''"))'$fullArg"
+    $cmd = "& '$takeScript' -Name '$($name.Replace("'","''"))'"
     Start-Work $cmd "Taking snapshot '$name'..." {
         $NameBox.Text = New-DefaultName
     }

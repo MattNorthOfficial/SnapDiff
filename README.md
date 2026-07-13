@@ -7,7 +7,7 @@ analyzing what tweaking tools and scripts actually change on a system.
 
 | Area | Source | Notes |
 | --- | --- | --- |
-| Registry | `reg.exe export` | Targeted high-signal roots by default; `-Full` for all of HKLM + HKCU |
+| Registry | `reg.exe export` | Entire HKLM + HKCU (override with `-RegistryRoots` for focused experiments) |
 | Services | WMI `Win32_Service` | Start mode + running state |
 | Power settings | `powercfg /query` | Active scheme + every setting index (AC/DC) |
 | Scheduled tasks | `Get-ScheduledTask` | Enable/disable state |
@@ -16,10 +16,10 @@ analyzing what tweaking tools and scripts actually change on a system.
 | Startup items | WMI `Win32_StartupCommand` | Run keys + startup folders |
 | Boot config | `bcdedit /enum` | Admin only (timer/HPET tweaks live here) |
 
-The default registry roots cover the areas gaming/latency tweaks touch: `CurrentControlSet\Control`
-(scheduler, session manager, power), `CurrentControlSet\Services` (service config + Tcpip/NDIS
-parameters), both `CurrentVersion` trees in HKLM, `HKLM\SOFTWARE\Policies`, `HKCU\Control Panel`,
-per-user `CurrentVersion`, Game Bar, and `GameConfigStore`.
+The registry capture covers the entire machine hive and current-user hive, so anything a
+tweak could write — scheduler settings, service/driver parameters, GPU driver class keys,
+Game Bar/Game DVR, vendor software, Classes/COM, WOW6432Node — is included. Expect a few
+hundred MB per snapshot; delete old snapshots freely.
 
 ## GUI
 
@@ -56,9 +56,6 @@ Outputs land in `reports\`:
 ## Options
 
 ```powershell
-# Snapshot the entire HKLM + HKCU (slow, ~100-300 MB, catches everything)
-.\Take-Snapshot.ps1 -Name big -Full
-
 # Snapshot only specific registry roots (fast, good for focused experiments)
 .\Take-Snapshot.ps1 -Name t1 -RegistryRoots 'HKCU\SOFTWARE\SomeApp','HKLM\SYSTEM\CurrentControlSet\Control\PriorityControl'
 
