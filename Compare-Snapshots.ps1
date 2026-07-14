@@ -98,8 +98,22 @@ $keyNoisePatterns = @(
     '\\FileExts\\[^\\]+\\OpenWithList',
     '\\ProfileService\\References\\',
     '\\CurrentVersion\\VFUProvider$',
-    '\\TIP\\AggregateResults'
+    '\\TIP\\AggregateResults',
+    # WMI provider-host tracking; churns whenever anything (including SnapDiff's own
+    # snapshot queries) uses WMI/CIM
+    '\\Wbem\\Tracing\\',
+    # OneSettings remote-config sync timestamps
+    '\\CurrentVersion\\Wosc\\',
+    # Task Scheduler internal bookkeeping (last-run info, dynamic triggers). Task
+    # enable/disable state is captured separately via Get-ScheduledTask, so nothing
+    # of value is lost.
+    '\\Schedule\\TaskCache\\',
+    # Windows Error Reporting process-termination records (WER *settings* stay visible)
+    '\\Windows Error Reporting\\TermReason'
 )
+# Value names that churn inside otherwise-interesting keys (checked alongside
+# $valueNoisePatterns below):
+#   ServiceSessionId - Windows licensing service rotates this every session
 # Value-name patterns that churn inside otherwise interesting keys (e.g. DHCP lease timers
 # inside Tcpip\Parameters\Interfaces, where TcpAckFrequency tweaks also live).
 $valueNoisePatterns = @(
@@ -108,7 +122,11 @@ $valueNoisePatterns = @(
     '^PendingFileRenameOperations',
     # ConsentStore usage timestamps churn, but the Allow/Deny 'Value' entries in the
     # same keys are real privacy tweaks - so only the timestamps are filtered.
-    '^LastUsedTime(Start|Stop)$'
+    '^LastUsedTime(Start|Stop)$',
+    # OneSettings-style sync attempt timestamps
+    '^Last(Refresh|Action|Sync)(Attempted|Succeeded)$',
+    # Software Protection Platform (licensing) session id, rotates per service session
+    '^ServiceSessionId$'
 )
 if ($IgnorePattern) { $keyNoisePatterns += $IgnorePattern }
 $keyNoiseRegex   = [regex]::new(($keyNoisePatterns -join '|'), 'IgnoreCase')
@@ -262,11 +280,44 @@ function Diff-Dict([hashtable]$B, [hashtable]$A) {
     return $changes
 }
 
-# Services: compare "StartMode | State"
-$svcSel = { param($i) $i.Name }
-$svcVal = { param($i) "$($i.StartMode) / $($i.State)" }
-$svcChanges = Diff-Dict (Read-JsonDict (Join-Path $beforeDir 'services.json') $svcSel $svcVal) `
-                        (Read-JsonDict (Join-Path $afterDir  'services.json') $svcSel $svcVal)
+# Services: start mode is configuration (what tweaks change) and is always reported.
+# Running-state-only changes are runtime churn (services start/stop on their own) and
+# are treated as noise unless -NoNoiseFilter is set.
+function Read-ServiceMap([string]$Path) {
+    $dict = @{}
+    if (-not (Test-Path $Path)) { return $dict }
+    foreach ($item in @((Get-Content $Path -Raw | ConvertFrom-Json))) {
+        if ($null -eq $item -or -not $item.Name) { continue }
+        $dict[$item.Name] = $item
+    }
+    return $dict
+}
+$svcB = Read-ServiceMap (Join-Path $beforeDir 'services.json')
+$svcA = Read-ServiceMap (Join-Path $afterDir 'services.json')
+$svcChanges = New-Object System.Collections.Generic.List[object]
+foreach ($k in ($svcA.Keys | Sort-Object)) {
+    if (-not $svcB.ContainsKey($k)) {
+        $svcChanges.Add([pscustomobject]@{ Item = $k; Before = '(not present)'; After = "$($svcA[$k].StartMode) / $($svcA[$k].State)" })
+        continue
+    }
+    $b0 = $svcB[$k]; $a0 = $svcA[$k]
+    if ("$($b0.StartMode)" -cne "$($a0.StartMode)") {
+        $svcChanges.Add([pscustomobject]@{ Item = $k; Before = "$($b0.StartMode) / $($b0.State)"; After = "$($a0.StartMode) / $($a0.State)" })
+    }
+    elseif ("$($b0.State)" -cne "$($a0.State)") {
+        if ($NoNoiseFilter) {
+            $svcChanges.Add([pscustomobject]@{ Item = $k; Before = "$($b0.StartMode) / $($b0.State)"; After = "$($a0.StartMode) / $($a0.State)" })
+        } else { $script:noiseSuppressed++ }
+    }
+}
+foreach ($k in ($svcB.Keys | Sort-Object)) {
+    if (-not $svcA.ContainsKey($k)) {
+        $svcChanges.Add([pscustomobject]@{ Item = $k; Before = "$($svcB[$k].StartMode) / $($svcB[$k].State)"; After = '(removed)' })
+    }
+}
+# Plain array: this PowerShell 5.1 build throws "Argument types do not match" when a
+# generic List is wrapped in @(...) further down.
+$svcChanges = $svcChanges.ToArray()
 
 # Scheduled tasks: only enable/disable transitions are interesting (Ready<->Running is churn)
 $taskSel = { param($i) $i.Task }
@@ -537,7 +588,7 @@ Write-Host "Diff complete in $([math]::Round($sw.Elapsed.TotalSeconds,1)) s." -F
 Write-Host "  Registry changes: $regChangeCount  (keys +$($keysAdded.Count)/-$($keysRemoved.Count), values +$($valuesAdded.Count)/-$($valuesRemoved.Count)/~$($valuesChanged.Count))"
 Write-Host "  Other changes:    $totalOther  (services $(@($svcChanges).Count), tasks $(@($taskChanges).Count), power $(@($powerChanges).Count + [int]$schemeChanged), tcp $(@($tcpChanges).Count), net $(@($netChanges).Count), startup $(@($startupChanges).Count), bcd $(@($bcdChanges).Count))"
 if (-not $NoNoiseFilter) {
-    Write-Host "  Noise suppressed: $script:noiseSuppressed registry entries (re-run with -NoNoiseFilter to see them)"
+    Write-Host "  Noise suppressed: $script:noiseSuppressed entries (re-run with -NoNoiseFilter to see them)"
 }
 Write-Host "  Report: $ReportPath"
 if ($regChangeCount -gt 0) {
