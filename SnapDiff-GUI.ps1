@@ -305,7 +305,9 @@ $timer.Add_Tick({
         Set-Busy $false
         $StatusText.Text = 'Done.'
         Refresh-Snapshots
-        if ($script:onDone) { & $script:onDone; $script:onDone = $null }
+        # Clear onDone BEFORE invoking so a callback that chains another Start-Work
+        # (e.g. rollback -> redo generation) can set a fresh onDone that survives.
+        if ($script:onDone) { $cb = $script:onDone; $script:onDone = $null; & $cb }
     }
     elseif ($script:activeProc) {
         Drain-Log
@@ -435,13 +437,60 @@ $OpenReportBtn.Add_Click({
 
 $UndoBtn.Add_Click({
     if (-not ($script:lastUndo -and (Test-Path $script:lastUndo))) { return }
+
+    # Does the undo touch HKLM? Those lines need administrator rights; importing them
+    # unelevated silently half-applies (HKCU succeeds, HKLM fails).
+    $undoText = Get-Content $script:lastUndo -Raw
+    $touchesHKLM = $undoText -match '(?im)^\[-?HKEY_LOCAL_MACHINE'
+    if ($touchesHKLM -and -not $isAdmin) {
+        [System.Windows.MessageBox]::Show(
+            "This rollback modifies HKEY_LOCAL_MACHINE, which requires administrator rights. Importing it now would only partially apply and could leave the registry inconsistent.`n`nUse 'Restart as Administrator' first, then re-run the compare and rollback.",
+            'Rollback needs elevation', 'OK', 'Warning') | Out-Null
+        return
+    }
+
     $res = [System.Windows.MessageBox]::Show(
-        "Import the undo file and roll back the registry to the BEFORE state?`n`n$($script:lastUndo)`n`nReview the file first if you have not already.",
+        "Roll back the registry to the '$($BeforeBox.SelectedItem)' state?`n`nBefore importing, SnapDiff will take a safety snapshot and write a REDO file so this rollback can itself be undone.`n`nUndo file:`n$($script:lastUndo)",
         'Confirm rollback', 'YesNo', 'Warning')
     if ($res -ne 'Yes') { return }
-    $out = & reg.exe import $script:lastUndo 2>&1
-    Append-Log ("reg import: " + ($out -join ' '))
-    $StatusText.Text = 'Rollback attempted - see log.'
+
+    # 1. Safety snapshot of the current (pre-rollback) state.
+    $safetyName = "pre-rollback-" + (Get-Date -Format "yyyyMMdd-HHmmss")
+    Append-Log ">>> Taking safety snapshot '$safetyName' before rollback..."
+    $cmd = "& '$takeScript' -Name '$safetyName'"
+    Start-Work $cmd "Safety snapshot before rollback..." {
+        # 2. After the safety snapshot completes, import the undo, capturing the real exit code.
+        Append-Log ">>> Importing undo file..."
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = 'reg.exe'
+        $psi.Arguments = "import `"$($script:lastUndo)`""
+        $psi.UseShellExecute = $false
+        $psi.RedirectStandardError = $true
+        $psi.RedirectStandardOutput = $true
+        $psi.CreateNoWindow = $true
+        $proc = [System.Diagnostics.Process]::Start($psi)
+        $stdout = $proc.StandardOutput.ReadToEnd()
+        $stderr = $proc.StandardError.ReadToEnd()
+        $proc.WaitForExit()
+        Append-Log (($stdout + $stderr).Trim())
+        if ($proc.ExitCode -eq 0) {
+            Append-Log "Rollback SUCCEEDED (reg import exit 0)."
+            $StatusText.Text = "Rollback complete. Safety snapshot '$safetyName' saved."
+            # 3. Generate a REDO file. The system is now at the 'Before' state; the redo
+            #    must take it back to the pre-rollback (safety) state, i.e. an undo that
+            #    "restores <safety> relative to <Before>". So: -Before <safety> -After <Before>.
+            $target = $BeforeBox.SelectedItem
+            Append-Log ">>> Generating redo file (compare '$safetyName' vs '$target')..."
+            $rcmd = "& '$compareScript' -Before '$safetyName' -After '$target'"
+            Start-Work $rcmd "Generating redo file..." {
+                $redoUndo = Join-Path $reportsDir "undo-$safetyName-vs-$target.reg"
+                if (Test-Path $redoUndo) { Append-Log "REDO file (re-applies what the rollback reverted): $redoUndo" }
+            }
+        } else {
+            Append-Log "Rollback FAILED or partial (reg import exit $($proc.ExitCode)). Your safety snapshot '$safetyName' captured the state just before this attempt."
+            $StatusText.Text = "Rollback failed - see log. Safety snapshot saved."
+        }
+    }
 })
 
 # --- Init -------------------------------------------------------------------------------------

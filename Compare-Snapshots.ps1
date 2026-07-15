@@ -133,11 +133,62 @@ $keyNoiseRegex   = [regex]::new(($keyNoisePatterns -join '|'), 'IgnoreCase')
 $valueNoiseRegex = [regex]::new(($valueNoisePatterns -join '|'), 'IgnoreCase')
 
 $script:noiseSuppressed = 0
+# Classifies a change as noise. Always evaluates the patterns; $NoNoiseFilter only
+# controls whether noise is *shown*, never whether it can enter the undo file.
+function Test-NoiseRaw([string]$Key, [string]$ValueName) {
+    if ($keyNoiseRegex.IsMatch($Key)) { return $true }
+    if ($ValueName -and $valueNoiseRegex.IsMatch($ValueName)) { return $true }
+    return $false
+}
+# Display-time noise gate: honours -NoNoiseFilter and counts suppressions.
 function Test-Noise([string]$Key, [string]$ValueName) {
     if ($NoNoiseFilter) { return $false }
-    if ($keyNoiseRegex.IsMatch($Key)) { $script:noiseSuppressed++; return $true }
-    if ($ValueName -and $valueNoiseRegex.IsMatch($ValueName)) { $script:noiseSuppressed++; return $true }
+    if (Test-NoiseRaw $Key $ValueName) { $script:noiseSuppressed++; return $true }
     return $false
+}
+
+# --- Protected keys (never safe to auto-roll-back) -----------------------------------
+# Device, driver, and security state. Reverting these via a blunt registry re-import is
+# what corrupts drivers: deleting a freshly-created device key or restoring stale driver
+# state leaves the on-disk driver and the registry out of sync. These are shown in the
+# report but EXCLUDED from the undo file, with a warning.
+$protectedPatterns = @(
+    '\\Control\\Class\\\{[0-9A-Fa-f\-]+\}',   # driver class keys (audio, GPU, network, ...)
+    '\\Enum\\',                                # device instance/enumeration state (PCI, USB, HDAUDIO...)
+    '\\MMDevices\\Audio',                      # audio endpoints
+    '\\DriverDatabase\\',                      # driver store index
+    '\\Services\\[^\\]+\\(Enum|Parameters\\Wdf)', # driver enum + WDF state under services
+    '\\SECURITY(\\|$)',                        # security hive
+    '\\SAM(\\|$)',                             # account database
+    '\\Control\\DeviceGuard\\',                # VBS/HVCI state - reverting can strand policy
+    '\\Policies\\Microsoft\\FVE'               # BitLocker
+)
+$protectedRegex = [regex]::new(($protectedPatterns -join '|'), 'IgnoreCase')
+$script:protectedSkipped = 0
+function Test-Protected([string]$Key) {
+    if ($protectedRegex.IsMatch($Key)) { return $true }
+    return $false
+}
+
+# --- Snapshot elevation metadata -----------------------------------------------------
+# A key exported by an elevated snapshot but not by an unelevated one shows up as
+# "added"/"removed" purely due to ACL visibility, not a real change. Rolling those back
+# means deleting real system keys. Detect the mismatch so the undo can protect HKLM.
+function Get-SnapshotIsAdmin([string]$Dir) {
+    $metaPath = Join-Path $Dir 'meta.json'
+    if (Test-Path $metaPath) {
+        try {
+            $meta = Get-Content $metaPath -Raw | ConvertFrom-Json
+            if ($null -ne $meta.IsAdmin) { return [bool]$meta.IsAdmin }
+        } catch { }
+    }
+    return $null
+}
+$beforeAdmin = Get-SnapshotIsAdmin $beforeDir
+$afterAdmin  = Get-SnapshotIsAdmin $afterDir
+$elevationMismatch = ($null -ne $beforeAdmin -and $null -ne $afterAdmin -and $beforeAdmin -ne $afterAdmin)
+if ($elevationMismatch) {
+    Write-Warning "Elevation mismatch: before(admin=$beforeAdmin) vs after(admin=$afterAdmin). HKLM 'added/removed key' differences may be ACL artifacts; they will be EXCLUDED from the undo file."
 }
 
 # --- .reg export parser ---------------------------------------------------------------
@@ -396,6 +447,14 @@ if ($bcdBefore.Count -gt 0 -and $bcdAfter.Count -gt 0) { $bcdChanges = Diff-Dict
 # Restores the BEFORE state: changed/removed values get their old data back, added
 # values are deleted ("name"=-), added keys are deleted ([-key]), removed keys are
 # recreated with their old values.
+#
+# SAFETY RULES (hardened after a driver-corruption incident):
+#   1. The undo is ALWAYS built from the noise-filtered set, even when the report was
+#      generated with -NoNoiseFilter. Churn must never be re-imported over live state.
+#   2. Protected device/driver/security keys are NEVER written to the undo file - a
+#      blunt registry re-import cannot safely revert driver state.
+#   3. On an elevation mismatch, HKLM key add/remove diffs are treated as ACL artifacts
+#      and excluded (deleting them could remove real system keys).
 $undoLinesByKey = New-Object 'System.Collections.Specialized.OrderedDictionary'
 function Add-UndoLine([string]$Key, [string]$Line) {
     if (-not $undoLinesByKey.Contains($Key)) {
@@ -407,12 +466,38 @@ function Format-RegValueLine([string]$Name, [string]$Data) {
     if ($Name -eq '@') { return "@=$Data" } else { return "`"$Name`"=$Data" }
 }
 
-foreach ($v in $valuesChanged) { Add-UndoLine $v.Key (Format-RegValueLine $v.Name $v.Old) }
-foreach ($v in $valuesRemoved) { Add-UndoLine $v.Key (Format-RegValueLine $v.Name $v.Old) }
-foreach ($v in $valuesAdded)   { Add-UndoLine $v.Key (Format-RegValueLine $v.Name '-') }
+$script:undoNoiseSkipped     = 0
+$script:undoProtectedSkipped = 0
+$script:undoElevationSkipped = 0
+$excludedKeys = New-Object System.Collections.Generic.List[object]  # {Key, Reason}
+
+# Returns $true if this key/value must be kept OUT of the undo file, recording why.
+function Test-UndoExcluded([string]$Key, [string]$ValueName) {
+    if (Test-NoiseRaw $Key $ValueName) { $script:undoNoiseSkipped++; return $true }
+    if (Test-Protected $Key) {
+        $script:undoProtectedSkipped++
+        $excludedKeys.Add([pscustomobject]@{ Key = $Key; Reason = 'protected (driver/device/security)' })
+        return $true
+    }
+    return $false
+}
+
+foreach ($v in $valuesChanged) { if (-not (Test-UndoExcluded $v.Key $v.Name)) { Add-UndoLine $v.Key (Format-RegValueLine $v.Name $v.Old) } }
+foreach ($v in $valuesRemoved) { if (-not (Test-UndoExcluded $v.Key $v.Name)) { Add-UndoLine $v.Key (Format-RegValueLine $v.Name $v.Old) } }
+foreach ($v in $valuesAdded)   { if (-not (Test-UndoExcluded $v.Key $v.Name)) { Add-UndoLine $v.Key (Format-RegValueLine $v.Name '-') } }
 foreach ($k in $keysRemoved) {
+    if (Test-UndoExcluded $k.Key $null) { continue }
+    if ($elevationMismatch -and $k.Key -match '^HKEY_LOCAL_MACHINE') { $script:undoElevationSkipped++; $excludedKeys.Add([pscustomobject]@{ Key = $k.Key; Reason = 'HKLM key, elevation mismatch' }); continue }
     foreach ($n in $k.Values.Keys) { Add-UndoLine $k.Key (Format-RegValueLine $n $k.Values[$n]) }
     if ($k.Values.Count -eq 0) { Add-UndoLine $k.Key '; (key had no values)' }
+}
+
+# Key-delete directives ([-key]) are the most destructive lines - guard them hardest.
+$undoKeyDeletes = New-Object System.Collections.Generic.List[string]
+foreach ($k in $keysAdded) {
+    if (Test-Protected $k.Key) { $script:undoProtectedSkipped++; $excludedKeys.Add([pscustomobject]@{ Key = $k.Key; Reason = 'protected key deletion blocked' }); continue }
+    if ($elevationMismatch -and $k.Key -match '^HKEY_LOCAL_MACHINE') { $script:undoElevationSkipped++; $excludedKeys.Add([pscustomobject]@{ Key = $k.Key; Reason = 'HKLM key deletion blocked (elevation mismatch)' }); continue }
+    $undoKeyDeletes.Add($k.Key)
 }
 
 $undoContent = New-Object System.Text.StringBuilder
@@ -420,10 +505,11 @@ $undoContent = New-Object System.Text.StringBuilder
 [void]$undoContent.AppendLine('')
 [void]$undoContent.AppendLine("; Undo file generated by Compare-Snapshots.ps1")
 [void]$undoContent.AppendLine("; Restores registry state of snapshot '$beforeName' (relative to '$afterName')")
+[void]$undoContent.AppendLine("; Excluded from this file for safety: $($script:undoProtectedSkipped) protected, $($script:undoElevationSkipped) elevation-artifact, $($script:undoNoiseSkipped) noise entries.")
 [void]$undoContent.AppendLine("; REVIEW BEFORE IMPORTING:  reg import `"$UndoPath`"")
 [void]$undoContent.AppendLine('')
-foreach ($k in $keysAdded) {
-    [void]$undoContent.AppendLine("[-$($k.Key)]")
+foreach ($k in $undoKeyDeletes) {
+    [void]$undoContent.AppendLine("[-$k]")
     [void]$undoContent.AppendLine('')
 }
 foreach ($key in $undoLinesByKey.Keys) {
@@ -433,7 +519,8 @@ foreach ($key in $undoLinesByKey.Keys) {
 }
 
 $regChangeCount = $keysAdded.Count + $keysRemoved.Count + $valuesAdded.Count + $valuesRemoved.Count + $valuesChanged.Count
-if ($regChangeCount -gt 0) {
+$undoLineCount = $undoKeyDeletes.Count + $undoLinesByKey.Keys.Count
+if ($undoLineCount -gt 0) {
     Set-Content -Path $UndoPath -Value $undoContent.ToString() -Encoding Unicode
 }
 
@@ -442,16 +529,23 @@ $diffRows = New-Object System.Collections.Generic.List[object]
 function Add-DiffRow([string]$Area, [string]$Item, [string]$B, [string]$A) {
     $diffRows.Add([pscustomobject]@{ Area = $Area; Item = $Item; Before = $B; After = $A })
 }
-foreach ($v in $valuesChanged) { Add-DiffRow 'Registry (changed)' "$($v.Key) :: $($v.Name)" $v.Old $v.New }
-foreach ($v in $valuesAdded)   { Add-DiffRow 'Registry (added)'   "$($v.Key) :: $($v.Name)" '(not present)' $v.New }
-foreach ($v in $valuesRemoved) { Add-DiffRow 'Registry (removed)' "$($v.Key) :: $($v.Name)" $v.Old '(removed)' }
+# Registry rows get a "(protected)" area suffix when the change is device/driver/security
+# state that was deliberately excluded from the undo file.
+function Reg-Area([string]$base, [string]$key) {
+    if (Test-Protected $key) { return "$base (protected)" } else { return $base }
+}
+foreach ($v in $valuesChanged) { Add-DiffRow (Reg-Area 'Registry (changed)' $v.Key) "$($v.Key) :: $($v.Name)" $v.Old $v.New }
+foreach ($v in $valuesAdded)   { Add-DiffRow (Reg-Area 'Registry (added)' $v.Key)   "$($v.Key) :: $($v.Name)" '(not present)' $v.New }
+foreach ($v in $valuesRemoved) { Add-DiffRow (Reg-Area 'Registry (removed)' $v.Key) "$($v.Key) :: $($v.Name)" $v.Old '(removed)' }
 foreach ($k in $keysAdded) {
-    if ($k.Values.Count -eq 0) { Add-DiffRow 'Registry (key added)' $k.Key '(not present)' '(empty key)' }
-    foreach ($n in $k.Values.Keys) { Add-DiffRow 'Registry (key added)' "$($k.Key) :: $n" '(not present)' $k.Values[$n] }
+    $ka = Reg-Area 'Registry (key added)' $k.Key
+    if ($k.Values.Count -eq 0) { Add-DiffRow $ka $k.Key '(not present)' '(empty key)' }
+    foreach ($n in $k.Values.Keys) { Add-DiffRow $ka "$($k.Key) :: $n" '(not present)' $k.Values[$n] }
 }
 foreach ($k in $keysRemoved) {
-    if ($k.Values.Count -eq 0) { Add-DiffRow 'Registry (key removed)' $k.Key '(empty key)' '(removed)' }
-    foreach ($n in $k.Values.Keys) { Add-DiffRow 'Registry (key removed)' "$($k.Key) :: $n" $k.Values[$n] '(removed)' }
+    $kr = Reg-Area 'Registry (key removed)' $k.Key
+    if ($k.Values.Count -eq 0) { Add-DiffRow $kr $k.Key '(empty key)' '(removed)' }
+    foreach ($n in $k.Values.Keys) { Add-DiffRow $kr "$($k.Key) :: $n" $k.Values[$n] '(removed)' }
 }
 if ($schemeChanged) { Add-DiffRow 'Power scheme' 'Active scheme' $beforeScheme $afterScheme }
 foreach ($c in $svcChanges)     { Add-DiffRow 'Service'          $c.Item "$($c.Before)" "$($c.After)" }
@@ -463,11 +557,15 @@ foreach ($c in $startupChanges) { Add-DiffRow 'Startup item'     $c.Item "$($c.B
 foreach ($c in $bcdChanges)     { Add-DiffRow 'Boot config'      $c.Item "$($c.Before)" "$($c.After)" }
 
 [pscustomobject]@{
-    Before          = $beforeName
-    After           = $afterName
-    Generated       = (Get-Date).ToString('o')
-    NoiseSuppressed = $script:noiseSuppressed
-    Rows            = $diffRows
+    Before             = $beforeName
+    After              = $afterName
+    Generated          = (Get-Date).ToString('o')
+    NoiseSuppressed    = $script:noiseSuppressed
+    UndoWritten        = (Test-Path $UndoPath)
+    ProtectedExcluded  = $script:undoProtectedSkipped
+    ElevationExcluded  = $script:undoElevationSkipped
+    ElevationMismatch  = [bool]$elevationMismatch
+    Rows               = $diffRows
 } | ConvertTo-Json -Depth 4 | Set-Content -Path $JsonPath -Encoding UTF8
 
 # --- Markdown report -----------------------------------------------------------------------
@@ -579,6 +677,19 @@ Append-DictSection 'Network adapter advanced properties' $netChanges
 Append-DictSection 'Startup items' $startupChanges
 Append-DictSection 'Boot configuration (bcdedit)' $bcdChanges
 
+if ($excludedKeys.Count -gt 0) {
+    [void]$md.AppendLine('## Excluded from rollback (undo file)')
+    [void]$md.AppendLine('')
+    [void]$md.AppendLine('These changes appear above but were deliberately left OUT of the undo file because auto-reverting them can corrupt drivers or system state. Revert them manually if needed (e.g. reinstall the driver, or use System Restore).')
+    [void]$md.AppendLine('')
+    [void]$md.AppendLine('| Key | Reason |')
+    [void]$md.AppendLine('| --- | --- |')
+    foreach ($e in ($excludedKeys | Sort-Object Key -Unique)) {
+        [void]$md.AppendLine("| $(Escape-Md $e.Key) | $(Escape-Md $e.Reason) |")
+    }
+    [void]$md.AppendLine('')
+}
+
 Set-Content -Path $ReportPath -Value $md.ToString() -Encoding UTF8
 
 # --- Console summary --------------------------------------------------------------------------
@@ -590,7 +701,15 @@ Write-Host "  Other changes:    $totalOther  (services $(@($svcChanges).Count), 
 if (-not $NoNoiseFilter) {
     Write-Host "  Noise suppressed: $script:noiseSuppressed entries (re-run with -NoNoiseFilter to see them)"
 }
+if ($script:undoProtectedSkipped -gt 0 -or $script:undoElevationSkipped -gt 0) {
+    Write-Host "  Excluded from undo (safety): $($script:undoProtectedSkipped) protected, $($script:undoElevationSkipped) elevation-artifact entries" -ForegroundColor Yellow
+}
+if ($elevationMismatch) {
+    Write-Host "  WARNING: snapshots differ in elevation - HKLM key add/remove excluded from undo" -ForegroundColor Yellow
+}
 Write-Host "  Report: $ReportPath"
-if ($regChangeCount -gt 0) {
+if (Test-Path $UndoPath) {
     Write-Host "  Undo:   $UndoPath  (review, then 'reg import' to roll back registry changes)"
+} elseif ($regChangeCount -gt 0) {
+    Write-Host "  Undo:   none written - all $regChangeCount registry change(s) were excluded for safety" -ForegroundColor Yellow
 }

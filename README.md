@@ -66,6 +66,30 @@ Outputs land in `reports\`:
 .\Compare-Snapshots.ps1 -Before before -After after -IgnorePattern '\\SomeChattyApp\\'
 ```
 
+## Rollback safety
+
+Rolling back is only safe for **setting-style** changes (a registry value that *is* the whole
+change). It is the wrong tool for reverting installs, updates, or driver changes, where the
+registry entries only index files that a re-import cannot restore. To protect against
+driver/system corruption, the undo file is built with these guardrails:
+
+- **Protected keys are never included.** Device/driver/security areas — driver class keys
+  (`Control\Class\{…}`), device enumeration (`Enum\`), audio endpoints (`MMDevices\Audio`),
+  the driver store, `SECURITY`/`SAM`, Device Guard, and BitLocker — are shown in the report
+  but excluded from the undo file, and listed under "Excluded from rollback". Revert those
+  manually (reinstall the driver, or use System Restore).
+- **Noise is never rolled back**, even when the report was generated with `-NoNoiseFilter`.
+- **Elevation-mismatch protection.** If the two snapshots were taken at different elevation
+  levels, HKLM key add/remove differences are treated as ACL visibility artifacts and
+  excluded (deleting them could remove real system keys). Take both snapshots at the same
+  elevation for a clean comparison.
+- **In the GUI**, a rollback first takes an automatic `pre-rollback-*` safety snapshot and
+  then generates a **redo** file (so the rollback itself can be undone), refuses to run an
+  HKLM rollback unless elevated, and reports the real `reg import` success/failure.
+
+Always keep a **System Restore point** (or VM checkpoint) as the real safety net —
+SnapDiff's undo covers the registry only.
+
 ## Tips for clean diffs
 
 - **One tweak per diff.** The shorter the window between snapshots, the less noise.
@@ -81,6 +105,6 @@ Outputs land in `reports\`:
 ## Limitations
 
 - Registry data is compared in raw `.reg` export form; binary values show as hex strings.
-- Deleting an *added* key via the undo file removes the whole key including any values
-  another process wrote to it in the meantime.
+- The undo file covers the registry only (minus protected/excluded keys). Service start-mode,
+  power, and bcdedit changes are reported with their before-values but reverted manually.
 - File-system changes are not captured (use Process Monitor for those).
